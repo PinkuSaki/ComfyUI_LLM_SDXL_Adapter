@@ -265,6 +265,7 @@ class LLMToSDXLAdapter(nn.Module):
             attention_mask=attention_mask,
             token_weights=token_weights,
         )
+        batch_size = hidden_states.shape[0]
         hidden_states = self._encode_input_sequence(hidden_states, attention_mask)
 
         need_query_weights = token_weights is not None
@@ -296,7 +297,6 @@ class LLMToSDXLAdapter(nn.Module):
                     need_weights=False,
                 )
             else:
-                batch_size = hidden_states.shape[0]
                 neutral_sequence = self._apply_output_stack(
                     self.compression_queries.expand(batch_size, -1, -1)
                 )
