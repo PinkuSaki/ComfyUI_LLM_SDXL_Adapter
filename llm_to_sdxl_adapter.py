@@ -282,28 +282,31 @@ class LLMToSDXLAdapter(nn.Module):
         )
 
         if query_weights is not None:
-            if empty_prompt_hidden_states is not None and empty_prompt_attention_mask is not None:
-                neutral_hidden_states, neutral_attention_mask, _ = self._prepare_sequence_inputs(
-                    empty_prompt_hidden_states,
-                    attention_mask=empty_prompt_attention_mask,
+            if empty_prompt_hidden_states is None or empty_prompt_attention_mask is None:
+                raise ValueError(
+                    "token_weights 已提供，但缺少 empty_prompt_hidden_states 或 "
+                    "empty_prompt_attention_mask。请将 T5GEMMATextEncoder 的空提示输出连接到 "
+                    "Apply T5Gemma LLM to Adapter。"
                 )
-                neutral_hidden_states = self._encode_input_sequence(
-                    neutral_hidden_states,
-                    neutral_attention_mask,
-                )
-                neutral_sequence, _ = self._encode_compressed_sequence(
-                    neutral_hidden_states,
-                    neutral_attention_mask,
-                    need_weights=False,
-                )
-            else:
-                neutral_sequence = self._apply_output_stack(
-                    self.compression_queries.expand(batch_size, -1, -1)
-                )
+
+            neutral_hidden_states, neutral_attention_mask, _ = self._prepare_sequence_inputs(
+                empty_prompt_hidden_states,
+                attention_mask=empty_prompt_attention_mask,
+            )
+            neutral_hidden_states = self._encode_input_sequence(
+                neutral_hidden_states,
+                neutral_attention_mask,
+            )
+            neutral_sequence, _ = self._encode_compressed_sequence(
+                neutral_hidden_states,
+                neutral_attention_mask,
+                need_weights=False,
+            )
             compressed_sequence = neutral_sequence + query_weights.unsqueeze(-1) * (compressed_sequence - neutral_sequence)
 
         # ===== STAGE 4: Pooling for Vector Embeddings =====
         # Pool the compressed sequence for vector embeddings
+        batch_size = compressed_sequence.shape[0]
         pooling_tokens = self.pooling_token.expand(batch_size, -1, -1)
         pooled_output, _ = self.pooling_attention(
             pooling_tokens,

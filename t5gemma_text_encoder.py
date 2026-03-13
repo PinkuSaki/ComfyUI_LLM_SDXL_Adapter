@@ -106,6 +106,11 @@ class T5GEMMATextEncoder:
 
         return inputs.input_ids.to(device), inputs.attention_mask.to(device)
 
+    def _encode_hidden_states(self, model, input_ids, attention_mask):
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            return outputs.last_hidden_state.to(torch.float32)
+
     def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype, emphasis="scale"):
         """
         Encode text using Language Model and return hidden states
@@ -123,29 +128,22 @@ class T5GEMMATextEncoder:
                 input_ids = inputs.input_ids.to(device)
                 attention_mask = inputs.attention_mask.to(device)
                 token_weights = torch.ones_like(input_ids, dtype=torch.float32, device=device)
-
-                with torch.no_grad():
-                    outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
-                    hidden_states = outputs.last_hidden_state.to(torch.float32)
+                hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
             else:
                 # 兼容旧工作流里的 scale / lerp 选项，但实际权重交给 adapter 侧的 sequence lerp 处理。
                 input_ids, attention_mask, token_weights = self._build_weighted_tokens(
                     llm_tokenizer, text, max_length, device
                 )
-
-                with torch.no_grad():
-                    outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
-                    hidden_states = outputs.last_hidden_state.to(torch.float32)
+                hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
 
             empty_input_ids, empty_attention_mask = self._build_empty_prompt_inputs(
                 llm_tokenizer, max_length, device
             )
-            with torch.no_grad():
-                empty_outputs = llm_model(
-                    input_ids=empty_input_ids,
-                    attention_mask=empty_attention_mask,
-                )
-                empty_hidden_states = empty_outputs.last_hidden_state.to(torch.float32)
+            empty_hidden_states = self._encode_hidden_states(
+                llm_model,
+                empty_input_ids,
+                empty_attention_mask,
+            )
 
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
             if emphasis != "disabled":
