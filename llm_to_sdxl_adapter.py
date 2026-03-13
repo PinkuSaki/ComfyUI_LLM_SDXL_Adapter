@@ -152,27 +152,51 @@ class LLMToSDXLAdapter(nn.Module):
             nn.Linear(sdxl_seq_dim, sdxl_pooled_dim)
         )
 
-    def _build_source_attention_bias(self, attention_mask, token_weights, query_len, device, dtype):
-        """构造 compression cross-attention 用的浮点 bias。"""
-        if attention_mask is None and token_weights is None:
+    def _run_compression_attention(self, queries, hidden_states, attention_mask, need_weights):
+        if attention_mask is not None:
+            key_padding_mask = ~attention_mask.bool()
+        else:
+            key_padding_mask = None
+
+        return self.compression_attention(
+            queries,
+            hidden_states,
+            hidden_states,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            average_attn_weights=False,
+        )
+
+    def _compute_query_weights(self, compression_weights, token_weights, attention_mask, dtype):
+        """把 source token 权重汇总成 compressed token 级别的插值权重。"""
+        if compression_weights is None or token_weights is None:
             return None
 
-        if attention_mask is None:
-            attention_mask = torch.ones(
-                token_weights.shape,
-                dtype=torch.long,
-                device=device
-            )
+        attn = compression_weights.mean(dim=1)
+        safe_weights = token_weights.to(dtype=dtype).clamp(1e-3, 4.0)
 
-        batch_size, seq_len = attention_mask.shape
-        bias = torch.zeros((batch_size, query_len, seq_len), device=device, dtype=dtype)
-        bias = bias.masked_fill(attention_mask[:, None, :] == 0, -1e4)
+        if attention_mask is not None:
+            mask = attention_mask.to(dtype=dtype)
+            valid_weights = torch.where(mask > 0, safe_weights, torch.ones_like(safe_weights))
+            mean_weight = (valid_weights * mask).sum(dim=-1, keepdim=True) / mask.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        else:
+            valid_weights = safe_weights
+            mean_weight = valid_weights.mean(dim=-1, keepdim=True)
 
-        if token_weights is not None:
-            safe_weights = token_weights.to(device=device, dtype=dtype).clamp(1e-3, 4.0)
-            bias = bias + torch.log(safe_weights)[:, None, :]
+        normalized_weights = valid_weights / mean_weight.clamp(min=1e-3)
+        query_weights = torch.matmul(attn, normalized_weights.unsqueeze(-1)).squeeze(-1)
 
-        return bias.repeat_interleave(self.num_heads, dim=0).contiguous()
+        return query_weights.clamp(1e-3, 4.0)
+
+    def _apply_output_stack(self, sequence):
+        """共享 gate 之后到 pooled 之前的后处理路径。"""
+        sequence = self.compression_norm(sequence)
+        sequence = sequence + self.output_position_embeddings
+
+        for block in self.narrow_attention_blocks:
+            sequence = block(sequence)
+
+        return sequence
 
     def forward(self, llm_hidden_states, attention_mask=None, token_weights=None):
         batch_size, seq_len, _ = llm_hidden_states.shape
@@ -214,20 +238,18 @@ class LLMToSDXLAdapter(nn.Module):
         # ===== STAGE 2: Compression (512 -> 308) =====
         # Prepare queries for compression
         queries = self.compression_queries.expand(batch_size, -1, -1)
-        compression_bias = self._build_source_attention_bias(
-            attention_mask=attention_mask,
-            token_weights=token_weights,
-            query_len=self.target_seq_len,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-
-        compressed_sequence, _ = self.compression_attention(
+        need_query_weights = token_weights is not None
+        compressed_sequence, compression_weights = self._run_compression_attention(
             queries,
             hidden_states,
-            hidden_states,
-            attn_mask=compression_bias,
-            need_weights=False,
+            attention_mask,
+            need_weights=need_query_weights,
+        )
+        query_weights = self._compute_query_weights(
+            compression_weights,
+            token_weights,
+            attention_mask,
+            hidden_states.dtype,
         )
 
         # Optional: Gate mechanism for mixing with queries
@@ -235,15 +257,12 @@ class LLMToSDXLAdapter(nn.Module):
         gate_weights = self.compression_gate(gate_input)
         compressed_sequence = gate_weights * compressed_sequence + (1 - gate_weights) * queries
 
-        # Apply normalization
-        compressed_sequence = self.compression_norm(compressed_sequence)
-
-        # Add output positional embeddings
-        compressed_sequence = compressed_sequence + self.output_position_embeddings
-
         # ===== STAGE 3: Narrow Processing (compressed sequence) =====
-        for block in self.narrow_attention_blocks:
-            compressed_sequence = block(compressed_sequence)
+        compressed_sequence = self._apply_output_stack(compressed_sequence)
+
+        if query_weights is not None:
+            neutral_sequence = self._apply_output_stack(queries)
+            compressed_sequence = neutral_sequence + query_weights.unsqueeze(-1) * (compressed_sequence - neutral_sequence)
 
         # ===== STAGE 4: Pooling for Vector Embeddings =====
         # Pool the compressed sequence for vector embeddings

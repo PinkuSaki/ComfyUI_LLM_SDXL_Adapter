@@ -102,7 +102,7 @@ class T5GEMMATextEncoder:
                     outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state.to(torch.float32)
             else:
-                # 兼容旧工作流里的 scale / lerp 选项，但实际权重交给 adapter attention 处理。
+                # 兼容旧工作流里的 scale / lerp 选项，但实际权重交给 adapter 侧的 sequence lerp 处理。
                 input_ids, attention_mask, token_weights = self._build_weighted_tokens(
                     llm_tokenizer, text, max_length, device
                 )
@@ -113,7 +113,7 @@ class T5GEMMATextEncoder:
 
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
             if emphasis != "disabled":
-                info += f"\nEmphasis: adapter_attention ({emphasis})"
+                info += "\nEmphasis: compressed_sequence_lerp"
 
             logger.info(f"Encoded text with shape: {hidden_states.shape}")
 
