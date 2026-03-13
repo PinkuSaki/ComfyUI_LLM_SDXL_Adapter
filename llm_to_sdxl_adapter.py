@@ -188,6 +188,26 @@ class LLMToSDXLAdapter(nn.Module):
 
         return query_weights.clamp(1e-3, 4.0)
 
+    def _should_apply_weighted_prompt(self, token_weights, attention_mask, dtype):
+        if token_weights is None:
+            return False
+
+        weights = token_weights.to(dtype=dtype)
+        if attention_mask is not None:
+            weights = weights[attention_mask > 0]
+        else:
+            weights = weights.reshape(-1)
+
+        if weights.numel() == 0:
+            return False
+
+        return not torch.allclose(
+            weights,
+            torch.ones_like(weights),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
     def _prepare_sequence_inputs(self, llm_hidden_states, attention_mask=None, token_weights=None):
         batch_size, seq_len, _ = llm_hidden_states.shape
 
@@ -265,23 +285,26 @@ class LLMToSDXLAdapter(nn.Module):
             attention_mask=attention_mask,
             token_weights=token_weights,
         )
-        batch_size = hidden_states.shape[0]
         hidden_states = self._encode_input_sequence(hidden_states, attention_mask)
 
-        need_query_weights = token_weights is not None
-        compressed_sequence, compression_weights = self._encode_compressed_sequence(
-            hidden_states,
-            attention_mask,
-            need_weights=need_query_weights,
-        )
-        query_weights = self._compute_query_weights(
-            compression_weights,
+        use_weighted_prompt = self._should_apply_weighted_prompt(
             token_weights,
             attention_mask,
             hidden_states.dtype,
         )
+        compressed_sequence, compression_weights = self._encode_compressed_sequence(
+            hidden_states,
+            attention_mask,
+            need_weights=use_weighted_prompt,
+        )
 
-        if query_weights is not None:
+        if use_weighted_prompt:
+            query_weights = self._compute_query_weights(
+                compression_weights,
+                token_weights,
+                attention_mask,
+                hidden_states.dtype,
+            )
             if empty_prompt_hidden_states is None or empty_prompt_attention_mask is None:
                 raise ValueError(
                     "token_weights 已提供，但缺少 empty_prompt_hidden_states 或 "

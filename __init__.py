@@ -128,11 +128,11 @@ CUSTOM_TYPES = {
     "LLM_MODEL": "Language Model instance",
     "LLM_TOKENIZER": "Language Model tokenizer instance",
     "LLM_HIDDEN_STATES": "LLM model hidden states",
-    "LLM_EMPTY_HIDDEN_STATES": "Empty-prompt hidden states used as an emphasis baseline",
+    "LLM_EMPTY_HIDDEN_STATES": "Empty-prompt hidden states used as a weighted-prompt baseline",
     "LLM_ADAPTER": "Adapter model instance",
     "LLM_ATTENTION_MASK": "LLM attention mask",
-    "LLM_EMPTY_ATTENTION_MASK": "Empty-prompt attention mask used as an emphasis baseline",
-    "LLM_TOKEN_WEIGHTS": "Per-token emphasis weights aligned with the tokenizer output",
+    "LLM_EMPTY_ATTENTION_MASK": "Empty-prompt attention mask used as a weighted-prompt baseline",
+    "LLM_TOKEN_WEIGHTS": "Per-token prompt weights aligned with the tokenizer output",
     "VECTOR_CONDITIONING": "SDXL vector conditioning",
 
 }

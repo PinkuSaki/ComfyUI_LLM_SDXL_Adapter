@@ -22,7 +22,6 @@ class T5GEMMATextEncoder:
                 "max_length": ("INT", {"default": 512, "min": 8, "max": 4096}),
                 "device": (["cpu", "cuda"], {"default": "cuda"}),
                 "dtype": (["float32", "bfloat16"], {"default": "bfloat16"}),
-                "emphasis": (["disabled", "scale", "lerp"], {"default": "scale"}),
             }
         }
 
@@ -63,36 +62,81 @@ class T5GEMMATextEncoder:
 
         return token_weights
 
+    def _has_nontrivial_weights(self, weights, attention_mask=None, atol=1e-6):
+        """仅在有效 token 上存在非 1.0 权重时，才启用加权路径。"""
+        if weights is None:
+            return False
+
+        if attention_mask is not None:
+            valid_weights = weights[attention_mask > 0]
+        else:
+            valid_weights = weights.reshape(-1)
+
+        if valid_weights.numel() == 0:
+            return False
+
+        return not torch.allclose(
+            valid_weights,
+            torch.ones_like(valid_weights),
+            atol=atol,
+            rtol=0.0,
+        )
+
+    def _tokenize_text(self, tokenizer, encoded_text, max_length, device, return_offsets_mapping=False):
+        tokenizer_kwargs = {
+            "return_tensors": "pt",
+            "padding": "max_length",
+            "max_length": max_length,
+            "truncation": True,
+        }
+        if return_offsets_mapping:
+            tokenizer_kwargs["return_offsets_mapping"] = True
+
+        inputs = tokenizer(encoded_text, **tokenizer_kwargs)
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+
+        return inputs, input_ids, attention_mask
+
     def _build_weighted_tokens(self, tokenizer, text, max_length, device):
         """
         解析 prompt 权重语法后，保持整串 tokenize，不破坏原始 token 序列。
         """
         plain_text, char_weights = build_weighted_character_map(text)
         encoded_text = plain_text + "<eos>"
-        char_weights.extend([1.0] * len("<eos>"))
+
+        if not self._has_nontrivial_weights(
+            torch.tensor(char_weights, dtype=torch.float32)
+        ):
+            _, input_ids, attention_mask = self._tokenize_text(
+                tokenizer,
+                encoded_text,
+                max_length,
+                device,
+            )
+            return input_ids, attention_mask, None, False
+
+        char_weights = char_weights + [1.0] * len("<eos>")
 
         try:
-            inputs = tokenizer(
+            inputs, input_ids, attention_mask = self._tokenize_text(
+                tokenizer,
                 encoded_text,
-                return_tensors="pt",
-                padding="max_length",
-                max_length=max_length,
-                truncation=True,
+                max_length,
+                device,
                 return_offsets_mapping=True,
             )
         except (NotImplementedError, TypeError, ValueError) as exc:
             raise RuntimeError(
-                "当前 tokenizer 不支持 offset mapping，无法在保持原始 tokenization 的前提下启用 emphasis。"
+                "当前 tokenizer 不支持 offset mapping，无法在保持原始 tokenization 的前提下处理加权 prompt。"
             ) from exc
 
         offsets = inputs.pop("offset_mapping")[0].tolist()
-        input_ids = inputs["input_ids"].to(device)
-        attention_mask = inputs["attention_mask"].to(device)
         token_weights = self._build_token_weights_from_offsets(
             offsets, attention_mask[0], char_weights, device
         )
 
-        return input_ids, attention_mask, token_weights
+        return input_ids, attention_mask, token_weights, True
 
     def _build_empty_prompt_inputs(self, tokenizer, max_length, device):
         """构造 empty-prompt 基线编码输入。"""
@@ -111,43 +155,33 @@ class T5GEMMATextEncoder:
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             return outputs.last_hidden_state.to(torch.float32)
 
-    def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype, emphasis="scale"):
+    def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype):
         """
         Encode text using Language Model and return hidden states
         """
         try:
-            if emphasis == "disabled":
-                # 原始路径：hidden states 不做 emphasis，仅输出全 1 token 权重。
-                inputs = llm_tokenizer(
-                    text + "<eos>",
-                    return_tensors="pt",
-                    padding="max_length",
-                    max_length=max_length,
-                    truncation=True,
-                )
-                input_ids = inputs.input_ids.to(device)
-                attention_mask = inputs.attention_mask.to(device)
-                token_weights = torch.ones_like(input_ids, dtype=torch.float32, device=device)
-                hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
-            else:
-                # 兼容旧工作流里的 scale / lerp 选项，但实际权重交给 adapter 侧的 sequence lerp 处理。
-                input_ids, attention_mask, token_weights = self._build_weighted_tokens(
-                    llm_tokenizer, text, max_length, device
-                )
-                hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
+            input_ids, attention_mask, token_weights, use_weighted_prompt = self._build_weighted_tokens(
+                llm_tokenizer, text, max_length, device
+            )
+            hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
 
-            empty_input_ids, empty_attention_mask = self._build_empty_prompt_inputs(
-                llm_tokenizer, max_length, device
-            )
-            empty_hidden_states = self._encode_hidden_states(
-                llm_model,
-                empty_input_ids,
-                empty_attention_mask,
-            )
+            empty_hidden_states = None
+            empty_attention_mask = None
+            if use_weighted_prompt:
+                empty_input_ids, empty_attention_mask = self._build_empty_prompt_inputs(
+                    llm_tokenizer, max_length, device
+                )
+                empty_hidden_states = self._encode_hidden_states(
+                    llm_model,
+                    empty_input_ids,
+                    empty_attention_mask,
+                )
 
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
-            if emphasis != "disabled":
-                info += "\nEmphasis: compressed_sequence_lerp (empty_prompt baseline)"
+            if use_weighted_prompt:
+                info += "\nWeighted prompt: compressed_sequence_lerp (empty_prompt baseline)"
+            else:
+                info += "\nWeighted prompt: passthrough (single encoder pass)"
 
             logger.info(f"Encoded text with shape: {hidden_states.shape}")
 
