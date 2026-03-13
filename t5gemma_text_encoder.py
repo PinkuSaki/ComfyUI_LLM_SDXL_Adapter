@@ -26,8 +26,8 @@ class T5GEMMATextEncoder:
             }
         }
 
-    RETURN_TYPES = ("LLM_HIDDEN_STATES", "LLM_ATTENTION_MASK", "STRING")
-    RETURN_NAMES = ("hidden_states", "attention_mask", "info")
+    RETURN_TYPES = ("LLM_HIDDEN_STATES", "LLM_ATTENTION_MASK", "STRING", "LLM_TOKEN_WEIGHTS")
+    RETURN_NAMES = ("hidden_states", "attention_mask", "info", "token_weights")
     FUNCTION = "encode_text"
     CATEGORY = "llm_sdxl"
 
@@ -86,7 +86,7 @@ class T5GEMMATextEncoder:
         """
         try:
             if emphasis == "disabled":
-                # 原始路径：不解析权重
+                # 原始路径：hidden states 不做 emphasis，仅输出全 1 token 权重。
                 inputs = llm_tokenizer(
                     text + "<eos>",
                     return_tensors="pt",
@@ -96,12 +96,13 @@ class T5GEMMATextEncoder:
                 )
                 input_ids = inputs.input_ids.to(device)
                 attention_mask = inputs.attention_mask.to(device)
+                token_weights = torch.ones_like(input_ids, dtype=torch.float32, device=device)
 
                 with torch.no_grad():
                     outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state.to(torch.float32)
             else:
-                # 加权路径：解析权重 → 编码 → 加权
+                # 兼容旧工作流里的 scale / lerp 选项，但实际权重交给 adapter attention 处理。
                 input_ids, attention_mask, token_weights = self._build_weighted_tokens(
                     llm_tokenizer, text, max_length, device
                 )
@@ -110,37 +111,13 @@ class T5GEMMATextEncoder:
                     outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state.to(torch.float32)
 
-                # [B, T] → [B, T, 1] 广播到 hidden dim
-                w = token_weights.unsqueeze(-1)
-
-                if emphasis == "lerp":
-                    # 中性基线插值：h_neutral + w * (h - h_neutral)
-                    neutral_inputs = llm_tokenizer(
-                        "<eos>",
-                        return_tensors="pt",
-                        padding="max_length",
-                        max_length=max_length,
-                        truncation=True,
-                    )
-                    neutral_ids = neutral_inputs.input_ids.to(device)
-                    neutral_mask = neutral_inputs.attention_mask.to(device)
-
-                    with torch.no_grad():
-                        neutral_out = llm_model(input_ids=neutral_ids, attention_mask=neutral_mask)
-                        neutral_states = neutral_out.last_hidden_state.to(torch.float32)
-
-                    hidden_states = neutral_states + w * (hidden_states - neutral_states)
-                else:
-                    # scale：直接缩放 h * w
-                    hidden_states = hidden_states * w
-
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
             if emphasis != "disabled":
-                info += f"\nEmphasis: {emphasis}"
+                info += f"\nEmphasis: adapter_attention ({emphasis})"
 
             logger.info(f"Encoded text with shape: {hidden_states.shape}")
 
-            return (hidden_states, attention_mask, info)
+            return (hidden_states, attention_mask, info, token_weights)
         except Exception as e:
             logger.error(f"Failed to encode text: {str(e)}")
             raise Exception(f"Text encoding failed: {str(e)}")

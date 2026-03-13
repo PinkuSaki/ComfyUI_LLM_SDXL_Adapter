@@ -89,6 +89,7 @@ class LLMToSDXLAdapter(nn.Module):
         self.num_heads = num_heads
 
         # Projections
+        self.seq_projection = None
         if llm_dim != sdxl_seq_dim:
             self.seq_projection = nn.Linear(llm_dim, sdxl_seq_dim)
 
@@ -151,7 +152,29 @@ class LLMToSDXLAdapter(nn.Module):
             nn.Linear(sdxl_seq_dim, sdxl_pooled_dim)
         )
 
-    def forward(self, llm_hidden_states, attention_mask=None):
+    def _build_source_attention_bias(self, attention_mask, token_weights, query_len, device, dtype):
+        """构造 compression cross-attention 用的浮点 bias。"""
+        if attention_mask is None and token_weights is None:
+            return None
+
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                token_weights.shape,
+                dtype=torch.long,
+                device=device
+            )
+
+        batch_size, seq_len = attention_mask.shape
+        bias = torch.zeros((batch_size, query_len, seq_len), device=device, dtype=dtype)
+        bias = bias.masked_fill(attention_mask[:, None, :] == 0, -1e4)
+
+        if token_weights is not None:
+            safe_weights = token_weights.to(device=device, dtype=dtype).clamp(1e-3, 4.0)
+            bias = bias + torch.log(safe_weights)[:, None, :]
+
+        return bias.repeat_interleave(self.num_heads, dim=0).contiguous()
+
+    def forward(self, llm_hidden_states, attention_mask=None, token_weights=None):
         batch_size, seq_len, _ = llm_hidden_states.shape
 
         # Project to target dimension
@@ -165,6 +188,8 @@ class LLMToSDXLAdapter(nn.Module):
             hidden_states = hidden_states[:, :self.max_input_len, :]
             if attention_mask is not None:
                 attention_mask = attention_mask[:, :self.max_input_len]
+            if token_weights is not None:
+                token_weights = token_weights[:, :self.max_input_len]
         else:
             if seq_len < self.max_input_len:
                 hidden_states = pad_to_length(hidden_states, self.max_input_len, dim=1)
@@ -173,6 +198,11 @@ class LLMToSDXLAdapter(nn.Module):
                 else:
                     attention_mask = torch.ones(batch_size, self.max_input_len, device=hidden_states.device)
                     attention_mask[:, seq_len:] = 0
+                if token_weights is not None:
+                    token_weights = pad_to_length(token_weights, self.max_input_len, dim=1, value=1.0)
+
+        if token_weights is not None and attention_mask is None:
+            attention_mask = torch.ones(batch_size, hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
 
         # Add positional embeddings
         hidden_states = hidden_states + self.input_position_embeddings
@@ -184,20 +214,20 @@ class LLMToSDXLAdapter(nn.Module):
         # ===== STAGE 2: Compression (512 -> 308) =====
         # Prepare queries for compression
         queries = self.compression_queries.expand(batch_size, -1, -1)
+        compression_bias = self._build_source_attention_bias(
+            attention_mask=attention_mask,
+            token_weights=token_weights,
+            query_len=self.target_seq_len,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
 
-        # Cross-attention for compression
-        if attention_mask is not None:
-            key_padding_mask = ~attention_mask.bool()
-        else:
-            key_padding_mask = None
-
-        compressed_sequence, compression_weights = self.compression_attention(
+        compressed_sequence, _ = self.compression_attention(
             queries,
             hidden_states,
             hidden_states,
-            key_padding_mask=key_padding_mask,
-            need_weights=True,
-            average_attn_weights=False  # Get weights for each head
+            attn_mask=compression_bias,
+            need_weights=False,
         )
 
         # Optional: Gate mechanism for mixing with queries
@@ -218,7 +248,7 @@ class LLMToSDXLAdapter(nn.Module):
         # ===== STAGE 4: Pooling for Vector Embeddings =====
         # Pool the compressed sequence for vector embeddings
         pooling_tokens = self.pooling_token.expand(batch_size, -1, -1)
-        pooled_output, pooling_weights = self.pooling_attention(
+        pooled_output, _ = self.pooling_attention(
             pooling_tokens,
             compressed_sequence,
             compressed_sequence,

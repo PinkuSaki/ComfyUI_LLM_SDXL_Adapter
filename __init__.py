@@ -130,6 +130,7 @@ CUSTOM_TYPES = {
     "LLM_HIDDEN_STATES": "LLM model hidden states",
     "LLM_ADAPTER": "Adapter model instance",
     "LLM_ATTENTION_MASK": "LLM attention mask",
+    "LLM_TOKEN_WEIGHTS": "Per-token emphasis weights aligned with the tokenizer output",
     "VECTOR_CONDITIONING": "SDXL vector conditioning",
 
 }
