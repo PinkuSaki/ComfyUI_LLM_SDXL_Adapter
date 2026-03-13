@@ -1,3 +1,4 @@
+import gc
 import torch
 import logging
 
@@ -22,6 +23,7 @@ class T5GEMMATextEncoder:
                 "max_length": ("INT", {"default": 512, "min": 8, "max": 4096}),
                 "device": (["cpu", "cuda"], {"default": "cuda"}),
                 "dtype": (["float32", "bfloat16"], {"default": "bfloat16"}),
+                "offload_after_encode": ("BOOLEAN", {"default": False}),
             }
         }
 
@@ -43,6 +45,35 @@ class T5GEMMATextEncoder:
     )
     FUNCTION = "encode_text"
     CATEGORY = "llm_sdxl"
+
+    def _model_is_on_device(self, model, target_device):
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            return False
+
+        target = torch.device(target_device)
+        if target.type == "cuda":
+            return model_device.type == "cuda" and (
+                target.index is None or model_device.index == target.index
+            )
+
+        return model_device == target
+
+    def _move_model_to_device(self, model, target_device):
+        if self._model_is_on_device(model, target_device):
+            return
+
+        model.to(target_device)
+
+    def _offload_model_to_cpu(self, model):
+        if self._model_is_on_device(model, "cpu"):
+            return
+
+        model.to("cpu")
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _build_token_weights_from_offsets(self, offsets, attention_mask, char_weights, device):
         """根据 tokenizer 的 offset mapping，把字符权重映射到 token 权重。"""
@@ -155,11 +186,12 @@ class T5GEMMATextEncoder:
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             return outputs.last_hidden_state.to(torch.float32)
 
-    def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype):
+    def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype, offload_after_encode):
         """
         Encode text using Language Model and return hidden states
         """
         try:
+            self._move_model_to_device(llm_model, device)
             input_ids, attention_mask, token_weights, use_weighted_prompt = self._build_weighted_tokens(
                 llm_tokenizer, text, max_length, device
             )
@@ -182,6 +214,9 @@ class T5GEMMATextEncoder:
                 info += "\nWeighted prompt: compressed_sequence_lerp (empty_prompt baseline)"
             else:
                 info += "\nWeighted prompt: passthrough (single encoder pass)"
+            if offload_after_encode:
+                self._offload_model_to_cpu(llm_model)
+                info += "\nModel offload: moved to CPU after encode"
 
             logger.info(f"Encoded text with shape: {hidden_states.shape}")
 
