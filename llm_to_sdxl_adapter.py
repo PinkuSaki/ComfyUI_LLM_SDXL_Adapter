@@ -188,6 +188,43 @@ class LLMToSDXLAdapter(nn.Module):
 
         return query_weights.clamp(1e-3, 4.0)
 
+    def _prepare_sequence_inputs(self, llm_hidden_states, attention_mask=None, token_weights=None):
+        batch_size, seq_len, _ = llm_hidden_states.shape
+
+        if self.seq_projection:
+            hidden_states = self.seq_projection(llm_hidden_states)
+        else:
+            hidden_states = llm_hidden_states
+
+        if seq_len > self.max_input_len:
+            hidden_states = hidden_states[:, :self.max_input_len, :]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :self.max_input_len]
+            if token_weights is not None:
+                token_weights = token_weights[:, :self.max_input_len]
+        elif seq_len < self.max_input_len:
+            hidden_states = pad_to_length(hidden_states, self.max_input_len, dim=1)
+            if attention_mask is not None:
+                attention_mask = pad_to_length(attention_mask, self.max_input_len, dim=1, value=0)
+            else:
+                attention_mask = torch.ones(batch_size, self.max_input_len, device=hidden_states.device)
+                attention_mask[:, seq_len:] = 0
+            if token_weights is not None:
+                token_weights = pad_to_length(token_weights, self.max_input_len, dim=1, value=1.0)
+
+        if token_weights is not None and attention_mask is None:
+            attention_mask = torch.ones(batch_size, hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
+
+        return hidden_states, attention_mask, token_weights
+
+    def _encode_input_sequence(self, hidden_states, attention_mask):
+        hidden_states = hidden_states + self.input_position_embeddings
+
+        for block in self.wide_attention_blocks:
+            hidden_states = block(hidden_states, attention_mask)
+
+        return hidden_states
+
     def _apply_output_stack(self, sequence):
         """共享 gate 之后到 pooled 之前的后处理路径。"""
         sequence = self.compression_norm(sequence)
@@ -198,49 +235,40 @@ class LLMToSDXLAdapter(nn.Module):
 
         return sequence
 
-    def forward(self, llm_hidden_states, attention_mask=None, token_weights=None):
-        batch_size, seq_len, _ = llm_hidden_states.shape
-
-        # Project to target dimension
-        if self.seq_projection:
-            hidden_states = self.seq_projection(llm_hidden_states)
-        else:
-            hidden_states = llm_hidden_states  
-
-        # Padding/truncation to max_input_len
-        if seq_len > self.max_input_len:
-            hidden_states = hidden_states[:, :self.max_input_len, :]
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, :self.max_input_len]
-            if token_weights is not None:
-                token_weights = token_weights[:, :self.max_input_len]
-        else:
-            if seq_len < self.max_input_len:
-                hidden_states = pad_to_length(hidden_states, self.max_input_len, dim=1)
-                if attention_mask is not None:
-                    attention_mask = pad_to_length(attention_mask, self.max_input_len, dim=1, value=0)
-                else:
-                    attention_mask = torch.ones(batch_size, self.max_input_len, device=hidden_states.device)
-                    attention_mask[:, seq_len:] = 0
-                if token_weights is not None:
-                    token_weights = pad_to_length(token_weights, self.max_input_len, dim=1, value=1.0)
-
-        if token_weights is not None and attention_mask is None:
-            attention_mask = torch.ones(batch_size, hidden_states.shape[1], device=hidden_states.device, dtype=torch.long)
-
-        # Add positional embeddings
-        hidden_states = hidden_states + self.input_position_embeddings
-
-        # ===== STAGE 1: Wide Processing (full sequence) =====
-        for block in self.wide_attention_blocks:
-            hidden_states = block(hidden_states, attention_mask)
-
-        # ===== STAGE 2: Compression (512 -> 308) =====
-        # Prepare queries for compression
+    def _encode_compressed_sequence(self, hidden_states, attention_mask, need_weights):
+        batch_size = hidden_states.shape[0]
         queries = self.compression_queries.expand(batch_size, -1, -1)
-        need_query_weights = token_weights is not None
         compressed_sequence, compression_weights = self._run_compression_attention(
             queries,
+            hidden_states,
+            attention_mask,
+            need_weights=need_weights,
+        )
+
+        gate_input = torch.cat([queries, compressed_sequence], dim=-1)
+        gate_weights = self.compression_gate(gate_input)
+        compressed_sequence = gate_weights * compressed_sequence + (1 - gate_weights) * queries
+        compressed_sequence = self._apply_output_stack(compressed_sequence)
+
+        return compressed_sequence, compression_weights
+
+    def forward(
+        self,
+        llm_hidden_states,
+        attention_mask=None,
+        token_weights=None,
+        empty_prompt_hidden_states=None,
+        empty_prompt_attention_mask=None,
+    ):
+        hidden_states, attention_mask, token_weights = self._prepare_sequence_inputs(
+            llm_hidden_states,
+            attention_mask=attention_mask,
+            token_weights=token_weights,
+        )
+        hidden_states = self._encode_input_sequence(hidden_states, attention_mask)
+
+        need_query_weights = token_weights is not None
+        compressed_sequence, compression_weights = self._encode_compressed_sequence(
             hidden_states,
             attention_mask,
             need_weights=need_query_weights,
@@ -252,16 +280,26 @@ class LLMToSDXLAdapter(nn.Module):
             hidden_states.dtype,
         )
 
-        # Optional: Gate mechanism for mixing with queries
-        gate_input = torch.cat([queries, compressed_sequence], dim=-1)
-        gate_weights = self.compression_gate(gate_input)
-        compressed_sequence = gate_weights * compressed_sequence + (1 - gate_weights) * queries
-
-        # ===== STAGE 3: Narrow Processing (compressed sequence) =====
-        compressed_sequence = self._apply_output_stack(compressed_sequence)
-
         if query_weights is not None:
-            neutral_sequence = self._apply_output_stack(queries)
+            if empty_prompt_hidden_states is not None and empty_prompt_attention_mask is not None:
+                neutral_hidden_states, neutral_attention_mask, _ = self._prepare_sequence_inputs(
+                    empty_prompt_hidden_states,
+                    attention_mask=empty_prompt_attention_mask,
+                )
+                neutral_hidden_states = self._encode_input_sequence(
+                    neutral_hidden_states,
+                    neutral_attention_mask,
+                )
+                neutral_sequence, _ = self._encode_compressed_sequence(
+                    neutral_hidden_states,
+                    neutral_attention_mask,
+                    need_weights=False,
+                )
+            else:
+                batch_size = hidden_states.shape[0]
+                neutral_sequence = self._apply_output_stack(
+                    self.compression_queries.expand(batch_size, -1, -1)
+                )
             compressed_sequence = neutral_sequence + query_weights.unsqueeze(-1) * (compressed_sequence - neutral_sequence)
 
         # ===== STAGE 4: Pooling for Vector Embeddings =====

@@ -19,6 +19,8 @@ class t5gemmaApplyLLMToSDXLAdapter:
             },
             "optional": {
                 "llm_token_weights": ("LLM_TOKEN_WEIGHTS",),
+                "llm_empty_hidden_states": ("LLM_EMPTY_HIDDEN_STATES",),
+                "llm_empty_attention_mask": ("LLM_EMPTY_ATTENTION_MASK",),
                 "width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
                 "height": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
                 "target_width": ("INT", {"default": 1024, "min": 64, "max": 8192, "step": 8}),
@@ -34,6 +36,8 @@ class t5gemmaApplyLLMToSDXLAdapter:
 
     def apply(self, llm_hidden_states, llm_attention_mask, llm_adapter,
               llm_token_weights=None,
+              llm_empty_hidden_states=None,
+              llm_empty_attention_mask=None,
               width=None, height=None, target_width=None, target_height=None, crop_w=None, crop_h=None):
         try:
             with torch.no_grad():
@@ -41,6 +45,8 @@ class t5gemmaApplyLLMToSDXLAdapter:
                     llm_hidden_states,
                     attention_mask=llm_attention_mask,
                     token_weights=llm_token_weights,
+                    empty_prompt_hidden_states=llm_empty_hidden_states,
+                    empty_prompt_attention_mask=llm_empty_attention_mask,
                 )
 
             prompt_embeds = prompt_embeds.cpu().contiguous()

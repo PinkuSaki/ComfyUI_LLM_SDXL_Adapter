@@ -26,8 +26,22 @@ class T5GEMMATextEncoder:
             }
         }
 
-    RETURN_TYPES = ("LLM_HIDDEN_STATES", "LLM_ATTENTION_MASK", "STRING", "LLM_TOKEN_WEIGHTS")
-    RETURN_NAMES = ("hidden_states", "attention_mask", "info", "token_weights")
+    RETURN_TYPES = (
+        "LLM_HIDDEN_STATES",
+        "LLM_ATTENTION_MASK",
+        "STRING",
+        "LLM_TOKEN_WEIGHTS",
+        "LLM_EMPTY_HIDDEN_STATES",
+        "LLM_EMPTY_ATTENTION_MASK",
+    )
+    RETURN_NAMES = (
+        "hidden_states",
+        "attention_mask",
+        "info",
+        "token_weights",
+        "empty_prompt_hidden_states",
+        "empty_prompt_attention_mask",
+    )
     FUNCTION = "encode_text"
     CATEGORY = "llm_sdxl"
 
@@ -80,6 +94,18 @@ class T5GEMMATextEncoder:
 
         return input_ids, attention_mask, token_weights
 
+    def _build_empty_prompt_inputs(self, tokenizer, max_length, device):
+        """构造 empty-prompt 基线编码输入。"""
+        inputs = tokenizer(
+            "<eos>",
+            return_tensors="pt",
+            padding="max_length",
+            max_length=max_length,
+            truncation=True,
+        )
+
+        return inputs.input_ids.to(device), inputs.attention_mask.to(device)
+
     def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype, emphasis="scale"):
         """
         Encode text using Language Model and return hidden states
@@ -111,13 +137,30 @@ class T5GEMMATextEncoder:
                     outputs = llm_model(input_ids=input_ids, attention_mask=attention_mask)
                     hidden_states = outputs.last_hidden_state.to(torch.float32)
 
+            empty_input_ids, empty_attention_mask = self._build_empty_prompt_inputs(
+                llm_tokenizer, max_length, device
+            )
+            with torch.no_grad():
+                empty_outputs = llm_model(
+                    input_ids=empty_input_ids,
+                    attention_mask=empty_attention_mask,
+                )
+                empty_hidden_states = empty_outputs.last_hidden_state.to(torch.float32)
+
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
             if emphasis != "disabled":
-                info += "\nEmphasis: compressed_sequence_lerp"
+                info += "\nEmphasis: compressed_sequence_lerp (empty_prompt baseline)"
 
             logger.info(f"Encoded text with shape: {hidden_states.shape}")
 
-            return (hidden_states, attention_mask, info, token_weights)
+            return (
+                hidden_states,
+                attention_mask,
+                info,
+                token_weights,
+                empty_hidden_states,
+                empty_attention_mask,
+            )
         except Exception as e:
             logger.error(f"Failed to encode text: {str(e)}")
             raise Exception(f"Text encoding failed: {str(e)}")
