@@ -20,6 +20,7 @@ class T5GEMMATextEncoder:
                 "llm_model": ("LLM_MODEL",),
                 "llm_tokenizer": ("LLM_TOKENIZER",),
                 "text": ("STRING", {"multiline": True, "default": "masterpiece, best quality, 1girl, anime style"}),
+                "enable_weighted_prompt": ("BOOLEAN", {"default": True}),
                 "max_length": ("INT", {"default": 512, "min": 8, "max": 4096}),
                 "device": (["cpu", "cuda"], {"default": "cuda"}),
                 "dtype": (["float32", "bfloat16"], {"default": "bfloat16"}),
@@ -129,6 +130,15 @@ class T5GEMMATextEncoder:
 
         return inputs, input_ids, attention_mask
 
+    def _build_raw_tokens(self, tokenizer, text, max_length, device):
+        _, input_ids, attention_mask = self._tokenize_text(
+            tokenizer,
+            text + "<eos>",
+            max_length,
+            device,
+        )
+        return input_ids, attention_mask
+
     def _build_weighted_tokens(self, tokenizer, text, max_length, device):
         """
         解析 prompt 权重语法后，保持整串 tokenize，不破坏原始 token 序列。
@@ -186,15 +196,24 @@ class T5GEMMATextEncoder:
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             return outputs.last_hidden_state.to(torch.float32)
 
-    def encode_text(self, llm_model, llm_tokenizer, text, max_length, device, dtype, offload_after_encode):
+    def encode_text(self, llm_model, llm_tokenizer, text, enable_weighted_prompt, max_length, device, dtype, offload_after_encode):
         """
         Encode text using Language Model and return hidden states
         """
         try:
             self._move_model_to_device(llm_model, device)
-            input_ids, attention_mask, token_weights, use_weighted_prompt = self._build_weighted_tokens(
-                llm_tokenizer, text, max_length, device
-            )
+
+            if enable_weighted_prompt:
+                input_ids, attention_mask, token_weights, use_weighted_prompt = self._build_weighted_tokens(
+                    llm_tokenizer, text, max_length, device
+                )
+            else:
+                input_ids, attention_mask = self._build_raw_tokens(
+                    llm_tokenizer, text, max_length, device
+                )
+                token_weights = None
+                use_weighted_prompt = False
+
             hidden_states = self._encode_hidden_states(llm_model, input_ids, attention_mask)
 
             empty_hidden_states = None
@@ -210,7 +229,9 @@ class T5GEMMATextEncoder:
                 )
 
             info = f"Text: {text[:50]}...\nEncoded: {hidden_states.shape[1]}\nShape: {hidden_states.shape}"
-            if use_weighted_prompt:
+            if not enable_weighted_prompt:
+                info += "\nWeighted prompt: disabled (raw tokenizer path)"
+            elif use_weighted_prompt:
                 info += "\nWeighted prompt: compressed_sequence_lerp (empty_prompt baseline)"
             else:
                 info += "\nWeighted prompt: passthrough (single encoder pass)"
